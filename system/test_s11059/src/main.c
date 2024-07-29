@@ -58,16 +58,18 @@ static void get_s11059_sensor_val(const struct device *dev){
         data.ir_frac = ir.val2;
 }
 
-void main(void){
+int main(void){
 	const struct device *dev_s11059 = get_s11059_device();
 
 	if (dev_s11059 == NULL){
 		printk("Failed to get device: s11059\n");
-		return;
+		return 1;
 	}
 
 	while(1){
 		get_s11059_sensor_val(dev_s11059);
 		k_sleep(K_MSEC(1000));
 	}
+
+	return 0;
 }
