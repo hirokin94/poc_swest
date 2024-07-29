@@ -1,19 +1,12 @@
-# HC-SR04 Ultrasonic Ranging Module
-#
-# Copyright (c) 2020 Daniel Veilleux
-#
-# SPDX-License-Identifier: LicenseRef-BSD-5-Clause-Nordic
-#
+# HC-SR04 Ultrasound sensor configuration options
 
-menuconfig HC_SR04
-	bool "HC-SR04 Ultrasonic Ranging Module"
+# Copyright (c) 2024 Adrien Leravat
+# SPDX-License-Identifier: Apache-2.0
+
+config HC_SR04
+	bool "HC-SR04 Ultrasound distance sensor"
+	default y
+	depends on DT_HAS_HC_SR04_ENABLED
+	depends on GPIO
 	help
-	  Enable HC-SR04 ultrasonic distance sensor.
-
-if HC_SR04
-
-module = HC_SR04
-module-str = HC-SR04
-source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
-
-endif #HC_SR04
+	  Enable driver for HC-SR04 distance sensor.

@@ -1,280 +1,189 @@
 /*
- * Copyright (c) 2020 Daniel Veilleux
+ * Copyright (c) 2024 Adrien Leravat
  *
- * SPDX-License-Identifier: LicenseRef-BSD-5-Clause-Nordic
+ * SPDX-License-Identifier: Apache-2.0
  */
 
-/*
- * NOTE: Invalid measurements manifest as a 128600us pulse followed by a second pulse of ~6us
- *       about 145us later. This pulse can't be truncated so it effectively reduces the sensor's
- *       working rate.
- */
-
-#define DT_DRV_COMPAT elecfreaks_hc_sr04
+#define DT_DRV_COMPAT hc_sr04
 
 #include <zephyr/kernel.h>
-#include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/devicetree.h>
-#include <zephyr/logging/log.h>
 #include <zephyr/drivers/sensor.h>
-//#include "hc_sr04.h"
+#include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(hc_sr04, CONFIG_HC_SR04_LOG_LEVEL);
+LOG_MODULE_REGISTER(HC_SR04, CONFIG_SENSOR_LOG_LEVEL);
 
-/* Timings defined by spec */
-#define T_TRIG_PULSE_US       11
-#define T_INVALID_PULSE_US    25000
-#define T_MAX_WAIT_MS         130
-#define T_SPURIOS_WAIT_US     145
-#define METERS_PER_SEC        340
+#define HC_SR04_MM_PER_MS     171
 
-enum hc_sr04_state {
-    HC_SR04_STATE_IDLE,
-    HC_SR04_STATE_RISING_EDGE,
-    HC_SR04_STATE_FALLING_EDGE,
-    HC_SR04_STATE_FINISHED,
-    HC_SR04_STATE_ERROR,
-    HC_SR04_STATE_COUNT
+static const uint32_t hw_cycles_per_ms = sys_clock_hw_cycles_per_sec() / 1000;
+
+struct hcsr04_data {
+	const struct device *dev;
+	struct gpio_callback gpio_cb;
+	struct k_sem sem;
+	uint32_t start_cycles;
+	atomic_t echo_high_cycles;
 };
 
-static struct hc_sr04_shared_resources {
-    struct k_sem         fetch_sem;
-    struct k_mutex       mutex;
-    bool                 ready; /* The module has been initialized */
-    enum hc_sr04_state   state;
-    uint32_t             start_time;
-    uint32_t             end_time;
-} m_shared_resources;
-
-struct hc_sr04_data {
-    struct sensor_value   sensor_value;
-    const struct device  *trig_dev;
-    const struct device  *echo_dev;
-    struct gpio_callback  echo_cb_data;
+struct hcsr04_config {
+	struct gpio_dt_spec trigger_gpios;
+	struct gpio_dt_spec echo_gpios;
 };
 
-struct hc_sr04_cfg {
-    const char * const   trig_port;
-    const uint8_t        trig_pin;
-    const uint32_t       trig_flags;
-    const char * const   echo_port;
-    const uint8_t        echo_pin;
-    const uint32_t       echo_flags;
-};
+static void hcsr04_gpio_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins);
 
-static void input_changed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+static int hcsr04_configure_gpios(const struct hcsr04_config *cfg)
 {
-    switch (m_shared_resources.state) {
-    case HC_SR04_STATE_RISING_EDGE:
-        m_shared_resources.start_time = k_cycle_get_32();
-        m_shared_resources.state = HC_SR04_STATE_FALLING_EDGE;
-        break;
-    case HC_SR04_STATE_FALLING_EDGE:
-        m_shared_resources.end_time = k_cycle_get_32();
-        (void) gpio_remove_callback(dev, cb);
-        m_shared_resources.state = HC_SR04_STATE_FINISHED;
-        k_sem_give(&m_shared_resources.fetch_sem);
-        break;
-    default:
-        (void) gpio_remove_callback(dev, cb);
-        m_shared_resources.state = HC_SR04_STATE_ERROR;
-        break;
-    }
+	int ret;
+
+	if (!gpio_is_ready_dt(&cfg->trigger_gpios)) {
+		LOG_ERR("GPIO '%s' not ready", cfg->trigger_gpios.port->name);
+		return -ENODEV;
+	}
+	ret = gpio_pin_configure_dt(&cfg->trigger_gpios, GPIO_OUTPUT_LOW);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure '%s' as output: %d", cfg->trigger_gpios.port->name,
+			ret);
+		return ret;
+	}
+
+	if (!gpio_is_ready_dt(&cfg->echo_gpios)) {
+		LOG_ERR("GPIO '%s' not ready", cfg->echo_gpios.port->name);
+		return -ENODEV;
+	}
+	ret = gpio_pin_configure_dt(&cfg->echo_gpios, GPIO_INPUT);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure '%s' as output: %d", cfg->echo_gpios.port->name, ret);
+		return ret;
+	}
+
+	return 0;
 }
 
-static int hc_sr04_init(const struct device *dev)
+static int hcsr04_configure_interrupt(const struct hcsr04_config *cfg, struct hcsr04_data *data)
 {
-    int err;
+	int ret;
 
-    struct hc_sr04_data      *p_data = dev->data;
-    const struct hc_sr04_cfg *p_cfg  = dev->config;
-
-    p_data->sensor_value.val1 = 0;
-    p_data->sensor_value.val2 = 0;
-
-    p_data->trig_dev = device_get_binding(p_cfg->trig_port);
-    if (!p_data->trig_dev) {
-        return -ENODEV;
-    }
-    p_data->echo_dev = device_get_binding(p_cfg->echo_port);
-    if (!p_data->echo_dev) {
-        return -ENODEV;
-    }
-    err = gpio_pin_configure(p_data->trig_dev, p_cfg->trig_pin, (GPIO_OUTPUT | p_cfg->trig_flags));
-    if (err != 0) {
-        return err;
-    }
-    err = gpio_pin_configure(p_data->echo_dev, p_cfg->echo_pin, (GPIO_INPUT | p_cfg->echo_flags));
-    if (err != 0) {
-        return err;
-    }
-    err = gpio_pin_interrupt_configure(p_data->echo_dev,
-                                       p_cfg->echo_pin,
-                                       GPIO_INT_EDGE_BOTH);
-    if (err != 0) {
-        return err;
-    }
-    gpio_init_callback(&p_data->echo_cb_data, input_changed, BIT(p_cfg->echo_pin));
-
-    if (m_shared_resources.ready) {
-        /* Already initialized */
-        return 0;
-    }
-
-    err = k_sem_init(&m_shared_resources.fetch_sem, 0, 1);
-    if (0 != err) {
-        return err;
-    }
-    err = k_mutex_init(&m_shared_resources.mutex);
-    if (0 != err) {
-        return err;
-    }
-
-    m_shared_resources.state = HC_SR04_STATE_IDLE;
-    m_shared_resources.ready = true;
-    return 0;
+	/* Disable initially to avoid spurious interrupts. */
+	ret = gpio_pin_interrupt_configure(cfg->echo_gpios.port, cfg->echo_gpios.pin,
+		GPIO_INT_DISABLE);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure '%s' as interrupt: %d", cfg->echo_gpios.port->name,
+			ret);
+		return -EIO;
+	}
+	gpio_init_callback(&data->gpio_cb, &hcsr04_gpio_callback, BIT(cfg->echo_gpios.pin));
+	ret = gpio_add_callback(cfg->echo_gpios.port, &data->gpio_cb);
+	if (ret < 0) {
+		LOG_ERR("Failed to add callback on '%s': %d", cfg->echo_gpios.port->name, ret);
+		return -EIO;
+	}
+	return 0;
 }
 
-static int hc_sr04_sample_fetch(const struct device *dev, enum sensor_channel chan)
+static int hcsr04_init(const struct device *dev)
 {
-    int      err;
-    uint32_t count;
+	const struct hcsr04_config *cfg = dev->config;
+	struct hcsr04_data *data = dev->data;
+	int ret;
 
-    struct hc_sr04_data      *p_data = dev->data;
-    const struct hc_sr04_cfg *p_cfg  = dev->config;
+	k_sem_init(&data->sem, 0, 1);
 
-    if (unlikely((SENSOR_CHAN_ALL != chan) && (SENSOR_CHAN_DISTANCE != chan))) {
-        return -ENOTSUP;
-    }
+	ret = hcsr04_configure_gpios(cfg);
+	if (ret < 0) {
+		return ret;
+	}
 
-    if (unlikely(!m_shared_resources.ready)) {
-        LOG_ERR("Driver is not initialized yet");
-        return -EBUSY;
-    }
+	ret = hcsr04_configure_interrupt(cfg, data);
+	if (ret < 0) {
+		return ret;
+	}
 
-    err = k_mutex_lock(&m_shared_resources.mutex, K_FOREVER);
-    if (0 != err) {
-        return err;
-    }
-
-    err = gpio_add_callback(p_data->echo_dev, &p_data->echo_cb_data);
-    if (0 != err) {
-        LOG_DBG("Failed to add HC-SR04 echo callback");
-        (void) k_mutex_unlock(&m_shared_resources.mutex);
-        return -EIO;
-    }
-
-    m_shared_resources.state = HC_SR04_STATE_RISING_EDGE;
-    gpio_pin_set(p_data->trig_dev, p_cfg->trig_pin, 1);
-    k_busy_wait(T_TRIG_PULSE_US);
-    gpio_pin_set(p_data->trig_dev, p_cfg->trig_pin, 0);
-
-    if (0 != k_sem_take(&m_shared_resources.fetch_sem, K_MSEC(T_MAX_WAIT_MS))) {
-        LOG_DBG("No response from HC-SR04");
-        (void) k_mutex_unlock(&m_shared_resources.mutex);
-        err = gpio_remove_callback(p_data->echo_dev, &p_data->echo_cb_data);
-        if (0 != err) {
-            return err;
-        }
-        return -EIO;
-    }
-
-    __ASSERT_NO_MSG(HC_SR04_STATE_FINISHED == m_shared_resources.state);
-
-    if (m_shared_resources.start_time <= m_shared_resources.end_time) {
-        count = (m_shared_resources.end_time - m_shared_resources.start_time);
-    } else {
-        count =  (0xFFFFFFFF - m_shared_resources.start_time);
-        count += m_shared_resources.end_time;
-    }
-    /* Convert from ticks to nanoseconds and then to microseconds */
-    count = k_cyc_to_us_near32(count);
-    if ((T_INVALID_PULSE_US > count) && (T_TRIG_PULSE_US < count)) {
-        /* Convert to meters and divide round-trip distance by two */
-        count = (count * METERS_PER_SEC / 2);
-        p_data->sensor_value.val2 = (count % 1000000);
-        p_data->sensor_value.val1 = (count / 1000000);
-    } else {
-        LOG_INF("Invalid measurement");
-        p_data->sensor_value.val1 = 0;
-        p_data->sensor_value.val2 = 0;
-        k_usleep(T_SPURIOS_WAIT_US);
-    }
-
-    err = k_mutex_unlock(&m_shared_resources.mutex);
-    if (0 != err) {
-        return err;
-    }
-    return 0;
+	return 0;
 }
 
-static int hc_sr04_channel_get(const struct device *dev,
-                    enum sensor_channel chan,
-                    struct sensor_value *val)
+static void hcsr04_gpio_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-    const struct hc_sr04_data *p_data = dev->data;
+	struct hcsr04_data *data = CONTAINER_OF(cb, struct hcsr04_data, gpio_cb);
+	const struct hcsr04_config *cfg = data->dev->config;
 
-    if (unlikely(!m_shared_resources.ready)) {
-        LOG_WRN("Device is not initialized yet");
-        return -EBUSY;
-    }
-
-    switch (chan) {
-    case SENSOR_CHAN_DISTANCE:
-        val->val2 = p_data->sensor_value.val2;
-        val->val1 = p_data->sensor_value.val1;
-        break;
-    default:
-        return -ENOTSUP;
-    }
-    return 0;
+	if (gpio_pin_get(dev, cfg->echo_gpios.pin) == 1) {
+		data->start_cycles = k_cycle_get_32();
+	} else {
+		atomic_set(&data->echo_high_cycles, k_cycle_get_32() - data->start_cycles);
+		gpio_pin_interrupt_configure_dt(&cfg->echo_gpios, GPIO_INT_DISABLE);
+		k_sem_give(&data->sem);
+	}
 }
 
-static const struct sensor_driver_api hc_sr04_driver_api = {
-    .sample_fetch = hc_sr04_sample_fetch,
-    .channel_get  = hc_sr04_channel_get,
+static int hcsr04_sample_fetch(const struct device *dev, enum sensor_channel chan)
+{
+	const struct hcsr04_config *cfg = dev->config;
+	struct hcsr04_data *data = dev->data;
+	int ret;
+
+	ret = gpio_pin_interrupt_configure_dt(&cfg->echo_gpios, GPIO_INT_EDGE_BOTH);
+	if (ret < 0) {
+		LOG_ERR("Failed to set configure echo pin as interrupt: %d", ret);
+		return ret;
+	}
+
+	/* Generate 10us trigger */
+	ret = gpio_pin_set_dt(&cfg->trigger_gpios, 1);
+	if (ret < 0) {
+		LOG_ERR("Failed to set trigger pin: %d", ret);
+		return ret;
+	}
+
+	k_busy_wait(10);
+
+	ret = gpio_pin_set_dt(&cfg->trigger_gpios, 0);
+	if (ret < 0) {
+		LOG_ERR("Failed to set trigger pin: %d", ret);
+		return ret;
+	}
+
+	if (k_sem_take(&data->sem, K_MSEC(10)) != 0) {
+		LOG_ERR("Echo signal was not received");
+		return -EIO;
+	}
+	return 0;
+}
+
+static int hcsr04_channel_get(const struct device *dev, enum sensor_channel chan,
+	struct sensor_value *val)
+{
+	const struct hcsr04_data *data = dev->data;
+	uint32_t distance_mm;
+
+	if (chan != SENSOR_CHAN_DISTANCE) {
+		return -ENOTSUP;
+	}
+
+	distance_mm = HC_SR04_MM_PER_MS * atomic_get(&data->echo_high_cycles) /
+			hw_cycles_per_ms;
+	return sensor_value_from_milli(val, distance_mm);
+}
+
+static const struct sensor_driver_api hcsr04_driver_api = {
+	.sample_fetch = hcsr04_sample_fetch,
+	.channel_get = hcsr04_channel_get
 };
 
 
-#define INST(num) DT_INST(num, elecfreaks_hc_sr04)
+#define HC_SR04_INIT(index)                                                           \
+	static struct hcsr04_data hcsr04_data_##index = {                             \
+		.dev = DEVICE_DT_INST_GET(index),                                     \
+		.start_cycles = 0,                                                    \
+		.echo_high_cycles = ATOMIC_INIT(0),                                   \
+	};                                                                            \
+	static struct hcsr04_config hcsr04_config_##index = {                         \
+		.trigger_gpios = GPIO_DT_SPEC_INST_GET(index, trigger_gpios),         \
+		.echo_gpios = GPIO_DT_SPEC_INST_GET(index, echo_gpios),               \
+	};                                                                            \
+                                                                                      \
+	SENSOR_DEVICE_DT_INST_DEFINE(index, &hcsr04_init, NULL, &hcsr04_data_##index, \
+				&hcsr04_config_##index, POST_KERNEL,                  \
+				CONFIG_SENSOR_INIT_PRIORITY, &hcsr04_driver_api);     \
 
-#define HC_SR04_DEVICE(n) \
-    static const struct hc_sr04_cfg hc_sr04_cfg_##n = { \
-        .trig_port  = DT_GPIO_LABEL(INST(n), trig_gpios), \
-        .trig_pin   = DT_GPIO_PIN(INST(n),   trig_gpios), \
-        .trig_flags = DT_GPIO_FLAGS(INST(n), trig_gpios), \
-        .echo_port  = DT_GPIO_LABEL(INST(n), echo_gpios), \
-        .echo_pin   = DT_GPIO_PIN(INST(n),   echo_gpios), \
-        .echo_flags = DT_GPIO_FLAGS(INST(n), echo_gpios), \
-    }; \
-    static struct hc_sr04_data hc_sr04_data_##n; \
-    DEVICE_AND_API_INIT(hc_sr04_##n, \
-                DT_LABEL(INST(n)), \
-                hc_sr04_init, \
-                &hc_sr04_data_##n, \
-                &hc_sr04_cfg_##n, \
-                POST_KERNEL, \
-                CONFIG_SENSOR_INIT_PRIORITY, \
-                &hc_sr04_driver_api);
-
-/*
-#define HC_SR04_INST(inst)						  \
-	static struct hc_sr04_data hc_sr04_data_##inst; 		  \
-	static const struct hc_sr04_dev_config hc_sr04_config_##inst = {  \
-		.trig_port = DT_GPIO_LABEL(INST(n), trig_gpios),	  \
-		.trig_pin = DT_GPIO_PIN(INST(n),   trig_gpios),		  \
-		.trig_flags = DT_GPIO_FLAGS(INST(n), trig_gpios),	  \
-		.echo_port  = DT_GPIO_LABEL(INST(n), echo_gpios),	  \
-		.echo_pin   = DT_GPIO_PIN(INST(n),   echo_gpios),	  \
-		.echo_flags = DT_GPIO_FLAGS(INST(n), echo_gpios),	  \
-	};								  \
-	SENSOR_DEVICE_DT_INST_DEFINE(inst, hc_sr04_inst, NULL, 		  \
-		&hc_sr04_data##inst, &hc_sr04_config_##inst, POST_KERNEL, \
-		CONFIG_SENSOR_INIT_PRIORITY, &hc_sr04_driver_api);
-*/
-DT_INST_FOREACH_STATUS_OKAY(HC_SR04_DEVICE)
-
-#if DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) == 0
-#warning "HC_SR04 driver enabled without any devices"
-#endif
+DT_INST_FOREACH_STATUS_OKAY(HC_SR04_INIT)
